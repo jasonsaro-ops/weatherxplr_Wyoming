@@ -14,7 +14,7 @@ const AIRNOW_API_KEY = "E5AFEF36-80F6-4A42-AE38-F3C56E3AEAC4";
 // and paste it in below - without it, the satellite hotspot section will
 // show a setup notice instead of live detections. WFIGS incident data below
 // works either way.
-const FIRMS_MAP_KEY = "YOUR_FIRMS_MAP_KEY";
+const FIRMS_MAP_KEY = "215020163103e2209b2fb8253d20b037";
 
 // NOTE: This is a very sparsely-monitored, remote stretch of the Laramie
 // Range near the WY/CO line - there is no USGS gauge directly on Fish Creek
