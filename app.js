@@ -9,6 +9,13 @@ let countdownVal = 120;
 
 const AIRNOW_API_KEY = "E5AFEF36-80F6-4A42-AE38-F3C56E3AEAC4"; 
 
+// Free MAP_KEY required for NASA FIRMS satellite fire-detection data.
+// Get one instantly (no cost) at https://firms.modaps.eosdis.nasa.gov/api/area/
+// and paste it in below - without it, the satellite hotspot section will
+// show a setup notice instead of live detections. WFIGS incident data below
+// works either way.
+const FIRMS_MAP_KEY = "YOUR_FIRMS_MAP_KEY";
+
 // NOTE: This is a very sparsely-monitored, remote stretch of the Laramie
 // Range near the WY/CO line - there is no USGS gauge directly on Fish Creek
 // itself here. These are the two nearest real USGS streamgages to the
@@ -99,7 +106,7 @@ const config = {
                 content: [
                     { type: 'component', componentName: 'cloudMap', title: 'WINDY DYNAMIC TRACKING & ARRAYS' },
                     { type: 'component', componentName: 'airQualityPanel', title: 'REGIONAL AIR QUALITY MATRIX (AIRNOW LIVE)' },
-                    { type: 'component', componentName: 'noaaTides', title: 'ACTIVE WILDFIRE INCIDENTS - S. WYOMING REGION (NIFC/WFIGS)' }
+                    { type: 'component', componentName: 'noaaTides', title: 'ACTIVE WILDFIRE ACTIVITY - S. WYOMING REGION (WFIGS + FIRMS SAT)' }
                 ]
             }
         ]
@@ -211,8 +218,14 @@ layout.registerComponent('noaaTides', function(container) {
             <div id="noaa-gauges" class="aqi-panel-wrap" style="margin-bottom: 5px;">
                 <span style="color:#8b949e; font-size:0.8rem;"><i class="fa-solid fa-fire"></i> Contacting NIFC wildfire incident feed...</span>
             </div>
-            <div style="flex-grow:1; min-height:180px; position:relative; background:#161b22; border: 1px solid #30363d; border-radius:4px; padding:10px;">
+            <div style="min-height:150px; position:relative; background:#161b22; border: 1px solid #30363d; border-radius:4px; padding:10px;">
                 <canvas id="noaaChart"></canvas>
+            </div>
+            <div>
+                <div style="font-size:0.75rem; color:#ffcc00; font-weight:bold; margin-bottom:5px;"><i class="fa-solid fa-satellite"></i> SATELLITE HOTSPOT DETECTIONS (NASA FIRMS, 48HR)</div>
+                <div id="firms-hotspots" style="max-height:160px; overflow-y:auto;">
+                    <span style="color:#8b949e; font-size:0.8rem;">Contacting FIRMS satellite feed...</span>
+                </div>
             </div>
         </div>
     `);
@@ -561,51 +574,88 @@ function openAQIDetails(key) {
 
 function fetchWildfireData() {
     // NOTE: Wyoming is landlocked, so NOAA tide data doesn't apply here. This
-    // panel is repurposed to pull live wildfire incident data from NIFC's
-    // WFIGS "Current Wildland Fire Incident Locations" service - the same
-    // authoritative interagency feed (IRWIN) behind NIFC's public fire maps -
-    // filtered to a regional bounding box covering southern Wyoming and the
-    // adjacent Colorado border area around Cherokee Park Rd / Fish Creek Rd.
+    // panel pulls two complementary wildfire data sources for a regional
+    // bounding box covering southern Wyoming and the adjacent Colorado
+    // border area around Cherokee Park Rd / Fish Creek Rd:
+    //   1) NIFC's WFIGS "Current Wildland Fire Incident Locations" service -
+    //      the authoritative interagency (IRWIN) feed with official names,
+    //      acreage, and containment. Brand-new, small, locally-managed fires
+    //      (e.g. handled by a county sheriff's office rather than a federal
+    //      incident management team) can take hours to appear here.
+    //   2) NASA FIRMS satellite active-fire detections (VIIRS) - independent
+    //      thermal hotspot data from satellite overpasses, updated multiple
+    //      times a day regardless of official incident reporting status, so
+    //      a brand-new fire like this typically shows up here first.
     const xmin = -107.5, ymin = 39.8, xmax = -104.0, ymax = 42.0;
-    const queryUrl = `https://services3.arcgis.com/T4QMspbfLg3qTGWY/arcgis/rest/services/WFIGS_Incident_Locations_Current/FeatureServer/0/query?where=1%3D1&geometry=${xmin}%2C${ymin}%2C${xmax}%2C${ymax}&geometryType=esriGeometryEnvelope&inSR=4326&spatialRel=esriSpatialRelIntersects&outFields=IncidentName,IncidentTypeCategory,IncidentSize,PercentContained,FireDiscoveryDateTime,POOState,POOCounty&returnGeometry=false&f=json`;
+    const wfigsUrl = `https://services3.arcgis.com/T4QMspbfLg3qTGWY/arcgis/rest/services/WFIGS_Incident_Locations_Current/FeatureServer/0/query?where=1%3D1&geometry=${xmin}%2C${ymin}%2C${xmax}%2C${ymax}&geometryType=esriGeometryEnvelope&inSR=4326&spatialRel=esriSpatialRelIntersects&outFields=IncidentName,IncidentTypeCategory,IncidentSize,PercentContained,FireDiscoveryDateTime,POOState,POOCounty&returnGeometry=false&f=json`;
+    const firmsUrl = `https://firms.modaps.eosdis.nasa.gov/api/area/csv/${FIRMS_MAP_KEY}/VIIRS_SNPP_NRT/${xmin},${ymin},${xmax},${ymax}/2`;
 
-    fetch(queryUrl)
-        .then(r => r.json())
-        .then(data => {
-            const feats = (data && data.features) ? data.features : [];
-            // Wildfires and fire complexes only - exclude prescribed (RX) burns
-            const incidents = feats
-                .map(f => f.attributes)
-                .filter(a => a.IncidentTypeCategory !== 'RX');
+    const wfigsPromise = fetch(wfigsUrl).then(r => r.json()).catch(() => null);
 
-            const activeCount = incidents.length;
-            const totalAcres = incidents.reduce((sum, a) => sum + (a.IncidentSize || 0), 0);
-            const largest = incidents.reduce((max, a) => (a.IncidentSize || 0) > (max.IncidentSize || 0) ? a : max, { IncidentSize: 0 });
+    const firmsPromise = (FIRMS_MAP_KEY === 'YOUR_FIRMS_MAP_KEY')
+        ? Promise.resolve(null)
+        : fetch(firmsUrl).then(r => r.text()).then(csv => {
+            const lines = csv.trim().split('\n');
+            if (lines.length < 2) return [];
+            const headers = lines[0].split(',');
+            const latIdx = headers.indexOf('latitude');
+            const lonIdx = headers.indexOf('longitude');
+            const dateIdx = headers.indexOf('acq_date');
+            const timeIdx = headers.indexOf('acq_time');
+            const confIdx = headers.indexOf('confidence');
+            const frpIdx = headers.indexOf('frp');
+            return lines.slice(1).map(line => {
+                const cols = line.split(',');
+                return {
+                    lat: parseFloat(cols[latIdx]),
+                    lon: parseFloat(cols[lonIdx]),
+                    date: cols[dateIdx],
+                    time: cols[timeIdx],
+                    confidence: cols[confIdx],
+                    frp: cols[frpIdx]
+                };
+            }).filter(d => !isNaN(d.lat) && !isNaN(d.lon));
+        }).catch(() => null);
 
-            let gaugeHtml = `<div style="display:grid; grid-template-columns: 1fr 1fr 1fr; gap:6px;">`;
-            gaugeHtml += `<div style="background:#161b22; border:1px solid #30363d; border-radius:3px; padding:6px; text-align:center;"><div style="font-size:0.65rem; color:#8b949e; font-weight:bold; margin-bottom:3px;">ACTIVE FIRES</div><div style="font-size:1.4rem; color:#ff6600; font-weight:bold;">${activeCount}</div><div style="font-size:0.6rem; color:#8b949e;">in region</div></div>`;
-            gaugeHtml += `<div style="background:#161b22; border:1px solid #30363d; border-radius:3px; padding:6px; text-align:center;"><div style="font-size:0.65rem; color:#8b949e; font-weight:bold; margin-bottom:3px;">TOTAL ACRES</div><div style="font-size:1.4rem; color:#ff6600; font-weight:bold;">${Math.round(totalAcres).toLocaleString()}</div><div style="font-size:0.6rem; color:#8b949e;">burning</div></div>`;
-            gaugeHtml += `<div style="background:#161b22; border:1px solid #30363d; border-radius:3px; padding:6px; text-align:center;"><div style="font-size:0.65rem; color:#8b949e; font-weight:bold; margin-bottom:3px;">LARGEST</div><div style="font-size:1.4rem; color:#ff6600; font-weight:bold;">${Math.round(largest.IncidentSize || 0).toLocaleString()}</div><div style="font-size:0.6rem; color:#8b949e;">acres</div></div>`;
-            gaugeHtml += `</div>`;
+    Promise.all([wfigsPromise, firmsPromise]).then(([wfigsData, firmsHotspots]) => {
+        const feats = (wfigsData && wfigsData.features) ? wfigsData.features : [];
+        // Wildfires and fire complexes only - exclude prescribed (RX) burns
+        const incidents = feats
+            .map(f => f.attributes)
+            .filter(a => a.IncidentTypeCategory !== 'RX');
 
-            if (activeCount === 0) {
-                gaugeHtml += `<div style="margin-top:6px;"><span style="color:#00ff55; font-size:0.7rem;"><i class="fa-solid fa-check"></i> NO ACTIVE WILDFIRE INCIDENTS REPORTED IN REGION</span></div>`;
-            }
+        const activeCount = incidents.length;
+        const totalAcres = incidents.reduce((sum, a) => sum + (a.IncidentSize || 0), 0);
+        const largest = incidents.reduce((max, a) => (a.IncidentSize || 0) > (max.IncidentSize || 0) ? a : max, { IncidentSize: 0 });
+        const hotspotCount = firmsHotspots ? firmsHotspots.length : null;
 
-            $('#noaa-gauges').html(gaugeHtml);
+        let gaugeHtml = `<div style="display:grid; grid-template-columns: 1fr 1fr 1fr; gap:6px;">`;
+        gaugeHtml += `<div style="background:#161b22; border:1px solid #30363d; border-radius:3px; padding:6px; text-align:center;"><div style="font-size:0.65rem; color:#8b949e; font-weight:bold; margin-bottom:3px;">NAMED FIRES</div><div style="font-size:1.4rem; color:#ff6600; font-weight:bold;">${activeCount}</div><div style="font-size:0.6rem; color:#8b949e;">WFIGS</div></div>`;
+        gaugeHtml += `<div style="background:#161b22; border:1px solid #30363d; border-radius:3px; padding:6px; text-align:center;"><div style="font-size:0.65rem; color:#8b949e; font-weight:bold; margin-bottom:3px;">TOTAL ACRES</div><div style="font-size:1.4rem; color:#ff6600; font-weight:bold;">${Math.round(totalAcres).toLocaleString()}</div><div style="font-size:0.6rem; color:#8b949e;">burning</div></div>`;
+        gaugeHtml += (hotspotCount !== null)
+            ? `<div style="background:#161b22; border:1px solid #30363d; border-radius:3px; padding:6px; text-align:center;"><div style="font-size:0.65rem; color:#8b949e; font-weight:bold; margin-bottom:3px;">HOTSPOTS</div><div style="font-size:1.4rem; color:#ff6600; font-weight:bold;">${hotspotCount}</div><div style="font-size:0.6rem; color:#8b949e;">FIRMS 48h</div></div>`
+            : `<div style="background:#161b22; border:1px solid #30363d; border-radius:3px; padding:6px; text-align:center;"><div style="font-size:0.65rem; color:#8b949e; font-weight:bold; margin-bottom:3px;">HOTSPOTS</div><div style="font-size:0.75rem; color:#8b949e;">NO KEY</div></div>`;
+        gaugeHtml += `</div>`;
 
-            // Chart: top incidents in the region by size, with containment % on hover
-            const sorted = incidents.slice().sort((a, b) => (b.IncidentSize || 0) - (a.IncidentSize || 0)).slice(0, 8);
-            const labels = sorted.map(a => a.IncidentName || 'Unnamed');
-            const sizes = sorted.map(a => a.IncidentSize || 0);
-            const contained = sorted.map(a => (a.PercentContained !== null && a.PercentContained !== undefined) ? a.PercentContained : null);
+        if (activeCount === 0 && (hotspotCount === null || hotspotCount === 0)) {
+            gaugeHtml += `<div style="margin-top:6px;"><span style="color:#00ff55; font-size:0.7rem;"><i class="fa-solid fa-check"></i> NO ACTIVE WILDFIRE ACTIVITY DETECTED IN REGION</span></div>`;
+        }
 
-            const ctx = document.getElementById('noaaChart').getContext('2d');
-            if (noaaChartInstance) noaaChartInstance.destroy();
+        $('#noaa-gauges').html(gaugeHtml);
 
-            Chart.defaults.color = '#8b949e';
-            Chart.defaults.font.family = "'Share Tech Mono', monospace";
+        // Chart: top named incidents in the region by size, with containment % on hover
+        const sorted = incidents.slice().sort((a, b) => (b.IncidentSize || 0) - (a.IncidentSize || 0)).slice(0, 8);
+        const labels = sorted.map(a => a.IncidentName || 'Unnamed');
+        const sizes = sorted.map(a => a.IncidentSize || 0);
+        const contained = sorted.map(a => (a.PercentContained !== null && a.PercentContained !== undefined) ? a.PercentContained : null);
 
+        const ctx = document.getElementById('noaaChart').getContext('2d');
+        if (noaaChartInstance) noaaChartInstance.destroy();
+
+        Chart.defaults.color = '#8b949e';
+        Chart.defaults.font.family = "'Share Tech Mono', monospace";
+
+        if (sizes.length) {
             noaaChartInstance = new Chart(ctx, {
                 type: 'bar',
                 data: {
@@ -639,10 +689,39 @@ function fetchWildfireData() {
                     }
                 }
             });
+        } else {
+            noaaChartInstance = null;
+            ctx.clearRect(0, 0, ctx.canvas.width, ctx.canvas.height);
+        }
 
-        }).catch(err => {
-            console.error("Wildfire Data Error:", err);
-            $('#noaa-gauges').html('<span style="color:#ff5555; font-size:0.8rem;"><i class="fa-solid fa-triangle-exclamation"></i> NIFC WILDFIRE FEED TIMEOUT</span>');
+        // Render satellite hotspot list
+        const hotspotContainer = $('#firms-hotspots');
+        if (FIRMS_MAP_KEY === 'YOUR_FIRMS_MAP_KEY') {
+            hotspotContainer.html('<span style="color:#ff8800; font-size:0.75rem;"><i class="fa-solid fa-triangle-exclamation"></i> Add a free FIRMS MAP_KEY (firms.modaps.eosdis.nasa.gov/api/area/) to enable satellite hotspot detection.</span>');
+        } else if (firmsHotspots === null) {
+            hotspotContainer.html('<span style="color:#ff5555; font-size:0.75rem;"><i class="fa-solid fa-triangle-exclamation"></i> FIRMS FEED UNREACHABLE</span>');
+        } else if (firmsHotspots.length === 0) {
+            hotspotContainer.html('<span style="color:#00ff55; font-size:0.75rem;"><i class="fa-solid fa-check"></i> No satellite hotspots detected in region in last 48h</span>');
+        } else {
+            const recent = firmsHotspots
+                .slice()
+                .sort((a, b) => (b.date + b.time).localeCompare(a.date + a.time))
+                .slice(0, 10);
+            let listHtml = '';
+            recent.forEach(h => {
+                const timeStr = h.time.padStart(4, '0');
+                listHtml += `
+                    <div style="background:#161b22; border:1px solid #30363d; border-radius:3px; padding:6px 8px; margin-bottom:5px; font-size:0.72rem;">
+                        <span style="color:#ff9900; font-weight:bold;">${h.lat.toFixed(3)}, ${h.lon.toFixed(3)}</span>
+                        <span style="color:#8b949e;"> · ${h.date} ${timeStr.slice(0,2)}:${timeStr.slice(2)} UTC · conf: ${h.confidence} · FRP: ${h.frp}</span>
+                    </div>`;
+            });
+            hotspotContainer.html(listHtml);
+        }
+
+    }).catch(err => {
+        console.error("Wildfire Data Error:", err);
+        $('#noaa-gauges').html('<span style="color:#ff5555; font-size:0.8rem;"><i class="fa-solid fa-triangle-exclamation"></i> WILDFIRE FEED TIMEOUT</span>');
     });
 }
 
